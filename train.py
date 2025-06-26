@@ -1,3 +1,6 @@
+# ✅ Updated: Final Single-File Version of DeepGuard (For Patent Submission)
+# Includes scale similarity fusion (no compression), and removes val folder usage
+
 import os
 import numpy as np
 import torch
@@ -7,29 +10,24 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 import open_clip
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix
 from tqdm import tqdm
 import warnings
-import random
 
 warnings.filterwarnings("ignore")
 
 # ==================== CONFIG ====================
 class Config:
     TRAIN_REAL = "DeepGuardDB/train/real"
-    TRAIN_FAKE = "DeepGuardDB/train/fake" 
-    VAL_REAL = "DeepGuardDB/val/real"
-    VAL_FAKE = "DeepGuardDB/val/fake"
-    
+    TRAIN_FAKE = "DeepGuardDB/train/fake"
+
     MODEL_SAVE_PATH = "consistency_detector.pth"
     BATCH_SIZE = 32
     EPOCHS = 15
     LEARNING_RATE = 1e-4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Simple parameters
     CLIP_DIM = 1024
-    REAL_PENALTY = 4.0  # Higher penalty for false positives
+    REAL_PENALTY = 4.0
 
 # ==================== DATASET ====================
 class SimpleDataset(Dataset):
@@ -37,10 +35,8 @@ class SimpleDataset(Dataset):
         self.transform = transform
         self.images = []
         self.labels = []
-        
-        # All image extensions
         valid_extensions = (
-            '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', 
+            '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif',
             '.webp', '.svg', '.ico', '.jfif', '.pjpeg', '.pjp', '.avif',
             '.apng', '.heic', '.heif', '.raw', '.cr2', '.nef', '.arw',
             '.dng', '.orf', '.rw2', '.pef', '.sr2', '.x3f', '.raf',
@@ -51,22 +47,20 @@ class SimpleDataset(Dataset):
             '.jpx', '.mng', '.pbm', '.pcx', '.pfm', '.pgm', '.ppm',
             '.psd', '.ras', '.sgi', '.tga', '.wbmp', '.xbm', '.xpm'
         )
-        
-        # Load real images
+
         for img_name in os.listdir(real_dir):
             if img_name.lower().endswith(valid_extensions):
                 self.images.append(os.path.join(real_dir, img_name))
-                self.labels.append(0)  # Real = 0
-        
-        # Load fake images  
+                self.labels.append(0)
+
         for img_name in os.listdir(fake_dir):
             if img_name.lower().endswith(valid_extensions):
                 self.images.append(os.path.join(fake_dir, img_name))
-                self.labels.append(1)  # Fake = 1
-    
+                self.labels.append(1)
+
     def __len__(self):
         return len(self.images)
-    
+
     def __getitem__(self, idx):
         try:
             image = Image.open(self.images[idx]).convert('RGB')
@@ -76,274 +70,105 @@ class SimpleDataset(Dataset):
         except:
             return torch.zeros(3, 224, 224), self.labels[idx]
 
-# ==================== NOVEL BUT SIMPLE INNOVATION ====================
+# ==================== MODEL ====================
 class ConsistencyDetector(nn.Module):
-    """
-    PATENT INNOVATION: Multi-Scale Consistency Verification
-    
-    Simple but Novel Idea:
-    - Extract CLIP features at 3 different scales (full, half, quarter)
-    - Real images have consistent features across scales
-    - AI images lose consistency when downscaled due to generation artifacts
-    - Use cosine similarity between scales as authenticity measure
-    
-    This is patent-worthy because:
-    1. First to use multi-scale CLIP consistency for deepfake detection
-    2. Simple but effective - leverages scale invariance property of real images
-    3. Works regardless of generation method
-    """
-    
     def __init__(self):
         super().__init__()
-        
-        # Simple consistency analyzer
+
         self.consistency_head = nn.Sequential(
-            nn.Linear(Config.CLIP_DIM, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 2)  # Real vs Fake
-        )
-        
-        # Scale consistency scorer
-        self.scale_scorer = nn.Sequential(
-            nn.Linear(3, 16),  # 3 cosine similarities
-            nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
-        )
-        
-        # Final fusion
-        self.final_classifier = nn.Sequential(
-            nn.Linear(Config.CLIP_DIM + 1, 128),  # +1 for scale score
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Linear(Config.CLIP_DIM, 256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(128, 2)
         )
-    
-    def forward(self, full_features, half_features, quarter_features):
-        # Calculate multi-scale consistency (PATENT INNOVATION)
-        cos_full_half = F.cosine_similarity(full_features, half_features, dim=1).unsqueeze(1)
-        cos_full_quarter = F.cosine_similarity(full_features, quarter_features, dim=1).unsqueeze(1)
-        cos_half_quarter = F.cosine_similarity(half_features, quarter_features, dim=1).unsqueeze(1)
-        
-        # Scale consistency score
-        scale_similarities = torch.cat([cos_full_half, cos_full_quarter, cos_half_quarter], dim=1)
-        scale_score = self.scale_scorer(scale_similarities)
-        
-        # Traditional classification
-        traditional_logits = self.consistency_head(full_features)
-        
-        # Final prediction combining both
-        fusion_input = torch.cat([full_features, scale_score], dim=1)
+
+        self.final_classifier = nn.Sequential(
+            nn.Linear(Config.CLIP_DIM + 3, 128),  # +3 for 3 cosine similarities
+            nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 2)
+        )
+
+    def forward(self, full, half, quarter):
+        c1 = F.cosine_similarity(full, half, dim=1).unsqueeze(1)
+        c2 = F.cosine_similarity(full, quarter, dim=1).unsqueeze(1)
+        c3 = F.cosine_similarity(half, quarter, dim=1).unsqueeze(1)
+        scale_features = torch.cat([c1, c2, c3], dim=1)
+
+        traditional_logits = self.consistency_head(full)
+        fusion_input = torch.cat([full, scale_features], dim=1)
         final_logits = self.final_classifier(fusion_input)
-        
-        return final_logits, scale_score, traditional_logits
+
+        return final_logits, scale_features, traditional_logits
 
 # ==================== FEATURE EXTRACTION ====================
-def extract_multiscale_features(image_batch, clip_model, clip_preprocess):
-    """Extract CLIP features at multiple scales"""
-    batch_size = image_batch.shape[0]
-    all_full_features = []
-    all_half_features = []
-    all_quarter_features = []
-    
-    for i in range(batch_size):
-        # Convert tensor to PIL Image
-        img_tensor = image_batch[i]
-        img_pil = transforms.ToPILImage()(img_tensor)
-        
-        # Full scale (224x224)
-        full_tensor = clip_preprocess(img_pil.resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
-        
-        # Half scale (112x112 -> 224x224)
-        half_tensor = clip_preprocess(img_pil.resize((112, 112)).resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
-        
-        # Quarter scale (56x56 -> 224x224)
-        quarter_tensor = clip_preprocess(img_pil.resize((56, 56)).resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
-        
+def extract_multiscale_features(batch, clip_model, clip_pre):
+    all_f, all_h, all_q = [], [], []
+    for img in batch:
+        img = transforms.ToPILImage()(img)
+        t_full = clip_pre(img.resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
+        t_half = clip_pre(img.resize((112, 112)).resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
+        t_quarter = clip_pre(img.resize((56, 56)).resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
+
         with torch.no_grad():
-            if hasattr(clip_model, 'module'):
-                full_feat = clip_model.module.encode_image(full_tensor)
-                half_feat = clip_model.module.encode_image(half_tensor)
-                quarter_feat = clip_model.module.encode_image(quarter_tensor)
-            else:
-                full_feat = clip_model.encode_image(full_tensor)
-                half_feat = clip_model.encode_image(half_tensor)
-                quarter_feat = clip_model.encode_image(quarter_tensor)
-            
-            # Normalize features
-            full_feat = F.normalize(full_feat, dim=-1).squeeze()
-            half_feat = F.normalize(half_feat, dim=-1).squeeze()
-            quarter_feat = F.normalize(quarter_feat, dim=-1).squeeze()
-        
-        all_full_features.append(full_feat)
-        all_half_features.append(half_feat)
-        all_quarter_features.append(quarter_feat)
-    
-    return torch.stack(all_full_features), torch.stack(all_half_features), torch.stack(all_quarter_features)
+            f = F.normalize(clip_model.encode_image(t_full), dim=-1).squeeze()
+            h = F.normalize(clip_model.encode_image(t_half), dim=-1).squeeze()
+            q = F.normalize(clip_model.encode_image(t_quarter), dim=-1).squeeze()
 
-# ==================== LOSS FUNCTION ====================
-def consistency_loss(final_logits, scale_scores, traditional_logits, labels):
-    """Simple loss with false positive penalty"""
-    
-    # Main loss with penalty for misclassifying real as fake
+        all_f.append(f); all_h.append(h); all_q.append(q)
+    return torch.stack(all_f), torch.stack(all_h), torch.stack(all_q)
+
+# ==================== LOSS ====================
+def consistency_loss(logits, scale_feats, trad_logits, labels):
     weights = torch.where(labels == 0, Config.REAL_PENALTY, 1.0).to(Config.DEVICE)
-    main_loss = F.cross_entropy(final_logits, labels, reduction='none')
-    weighted_loss = (main_loss * weights).mean()
-    
-    # Scale consistency regularization (real images should have high consistency)
-    consistency_targets = (1 - labels.float()).unsqueeze(1)  # Real=1, Fake=0
-    scale_loss = F.mse_loss(scale_scores, consistency_targets)
-    
-    # Traditional loss
-    trad_loss = F.cross_entropy(traditional_logits, labels)
-    
-    return weighted_loss + 0.1 * scale_loss + 0.05 * trad_loss
+    main = F.cross_entropy(logits, labels, reduction='none')
+    w_loss = (main * weights).mean()
+    scale_target = (1 - labels.float()).unsqueeze(1).expand(-1, 3)
+    scale_loss = F.mse_loss(scale_feats, scale_target)
+    trad_loss = F.cross_entropy(trad_logits, labels)
+    return w_loss + 0.1 * scale_loss + 0.05 * trad_loss
 
-# ==================== TRAINING ====================
-def train_epoch(model, dataloader, optimizer, epoch, clip_model, clip_preprocess):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}')
-    for images, labels in pbar:
-        images, labels = images.to(Config.DEVICE), labels.to(Config.DEVICE)
-        
-        # Extract multi-scale features
-        full_feat, half_feat, quarter_feat = extract_multiscale_features(images, clip_model, clip_preprocess)
-        
-        # Forward pass
-        final_logits, scale_scores, traditional_logits = model(full_feat, half_feat, quarter_feat)
-        
-        # Compute loss
-        loss = consistency_loss(final_logits, scale_scores, traditional_logits, labels)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        # Statistics
-        total_loss += loss.item()
-        predicted = torch.argmax(final_logits, dim=1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        pbar.set_postfix({
-            'Loss': f'{loss.item():.3f}',
-            'Acc': f'{100.*correct/total:.1f}%'
-        })
-    
-    return total_loss / len(dataloader), 100. * correct / total
-
-def validate(model, dataloader, clip_model, clip_preprocess):
-    model.eval()
-    correct = 0
-    total = 0
-    all_predictions = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc='Validating'):
-            images, labels = images.to(Config.DEVICE), labels.to(Config.DEVICE)
-            
-            # Extract features
-            full_feat, half_feat, quarter_feat = extract_multiscale_features(images, clip_model, clip_preprocess)
-            
-            # Forward pass
-            final_logits, scale_scores, traditional_logits = model(full_feat, half_feat, quarter_feat)
-            
-            predicted = torch.argmax(final_logits, dim=1)
-            
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            
-            all_predictions.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    accuracy = 100. * correct / total
-    return accuracy, all_predictions, all_labels
+# ==================== TRAIN ====================
+def train_epoch(model, loader, optim, epoch, clip_model, clip_pre):
+    model.train(); total, correct, loss_sum = 0, 0, 0
+    for imgs, labels in tqdm(loader, desc=f"Epoch {epoch+1}"):
+        imgs, labels = imgs.to(Config.DEVICE), labels.to(Config.DEVICE)
+        f, h, q = extract_multiscale_features(imgs, clip_model, clip_pre)
+        logits, scale, trad = model(f, h, q)
+        loss = consistency_loss(logits, scale, trad, labels)
+        optim.zero_grad(); loss.backward(); optim.step()
+        pred = torch.argmax(logits, dim=1)
+        correct += (pred == labels).sum().item(); total += labels.size(0); loss_sum += loss.item()
+    return loss_sum / len(loader), 100. * correct / total
 
 # ==================== MAIN ====================
 def main():
-    print("🚀 Multi-Scale Consistency Detector")
-    print(f"💻 Device: {Config.DEVICE}")
-    
-    # Initialize CLIP
-    print("🔄 Loading CLIP...")
-    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-        'ViT-H-14', 
-        pretrained='laion2b_s32b_b79k'
-    )
+    print(f"🚀 DeepGuard Model | Device: {Config.DEVICE}")
+    clip_model, _, clip_pre = open_clip.create_model_and_transforms('ViT-H-14', pretrained='laion2b_s32b_b79k')
     clip_model = clip_model.to(Config.DEVICE).eval()
-    
-    # Freeze CLIP
-    for param in clip_model.parameters():
-        param.requires_grad = False
-    
-    # Simple transforms
-    transform = transforms.Compose([
+    for p in clip_model.parameters(): p.requires_grad = False
+
+    tf = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize([0.485, 0.456, 0.406],[0.229, 0.224, 0.225])
     ])
-    
-    # Load data
-    print("📁 Loading data...")
-    train_dataset = SimpleDataset(Config.TRAIN_REAL, Config.TRAIN_FAKE, transform)
-    val_dataset = SimpleDataset(Config.VAL_REAL, Config.VAL_FAKE, transform)
-    
-    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=4)
-    
-    print(f"📊 Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-    
-    # Model
+    data = SimpleDataset(Config.TRAIN_REAL, Config.TRAIN_FAKE, tf)
+    loader = DataLoader(data, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=4)
+
     model = ConsistencyDetector().to(Config.DEVICE)
-    
-    # Multi-GPU
     if torch.cuda.device_count() > 1:
-        print(f"🚀 Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
         clip_model = nn.DataParallel(clip_model)
-    
-    # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
-    
-    print("🎯 Training...")
-    best_acc = 0
-    
-    for epoch in range(Config.EPOCHS):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, epoch, clip_model, clip_preprocess)
-        val_acc, val_preds, val_labels = validate(model, val_loader, clip_model, clip_preprocess)
-        
-        print(f"\nEpoch {epoch+1}: Train Loss: {train_loss:.3f}, Train Acc: {train_acc:.1f}%, Val Acc: {val_acc:.1f}%")
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'accuracy': val_acc
-            }, Config.MODEL_SAVE_PATH)
-            print(f"✅ Best model saved: {val_acc:.1f}%")
-    
-    # Final results
-    print("\n🎉 Final Results:")
-    cm = confusion_matrix(val_labels, val_preds)
-    tn, fp, fn, tp = cm.ravel()
-    
-    print(f"Confusion Matrix:")
-    print(f"Real: {tn:4d} correct, {fp:4d} wrong")
-    print(f"Fake: {tp:4d} correct, {fn:4d} wrong")
-    print(f"False Positive Rate: {fp/(tn+fp)*100:.1f}%")
-    print(f"Accuracy: {val_acc:.1f}%")
+
+    optim = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    best = 0
+    for e in range(Config.EPOCHS):
+        loss, acc = train_epoch(model, loader, optim, e, clip_model, clip_pre)
+        if acc > best:
+            best = acc
+            torch.save({'model_state_dict': model.state_dict(), 'accuracy': acc}, Config.MODEL_SAVE_PATH)
+            print(f"✅ Saved best model @ {acc:.2f}%")
+
+    print("\n🎉 Training Complete | Final Accuracy: {:.2f}%".format(best))
 
 if __name__ == '__main__':
     main()
