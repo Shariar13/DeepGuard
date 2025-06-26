@@ -109,9 +109,9 @@ def extract_multiscale_features(batch, clip_model, clip_pre):
         t_quarter = clip_pre(img.resize((56, 56)).resize((224, 224))).unsqueeze(0).to(Config.DEVICE)
 
         with torch.no_grad():
-            f = F.normalize(clip_model.encode_image(t_full), dim=-1).squeeze()
-            h = F.normalize(clip_model.encode_image(t_half), dim=-1).squeeze()
-            q = F.normalize(clip_model.encode_image(t_quarter), dim=-1).squeeze()
+            f = F.normalize(clip_model.module.encode_image(t_full) if hasattr(clip_model, 'module') else clip_model.encode_image(t_full), dim=-1).squeeze()
+            h = F.normalize(clip_model.module.encode_image(t_half) if hasattr(clip_model, 'module') else clip_model.encode_image(t_half), dim=-1).squeeze()
+            q = F.normalize(clip_model.module.encode_image(t_quarter) if hasattr(clip_model, 'module') else clip_model.encode_image(t_quarter), dim=-1).squeeze()
 
         all_f.append(f); all_h.append(h); all_q.append(q)
     return torch.stack(all_f), torch.stack(all_h), torch.stack(all_q)
@@ -155,9 +155,9 @@ def main():
     loader = DataLoader(data, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=4)
 
     model = ConsistencyDetector().to(Config.DEVICE)
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        clip_model = nn.DataParallel(clip_model)
+    # Removed DataParallel usage – using single GPU or CPU
+    # clip_model = nn.DataParallel(clip_model)
+    # model = nn.DataParallel(model)
 
     optim = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
     best = 0
