@@ -403,6 +403,18 @@ def main():
     print("🚀 Authenticity Verifier with Spatial Consistency Analysis")
     print(f"💻 Using device: {Config.DEVICE}")
     
+    # Initialize CLIP model first
+    print("🔄 Loading CLIP model...")
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        'ViT-H-14', 
+        pretrained='laion2b_s32b_b79k'
+    )
+    clip_model = clip_model.to(Config.DEVICE).eval()
+    
+    # Freeze CLIP parameters to prevent overfitting on small dataset
+    for param in clip_model.parameters():
+        param.requires_grad = False
+    
     # Set random seeds for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
@@ -502,19 +514,6 @@ def main():
     
     print(f"\n💾 Best model saved to: {Config.MODEL_SAVE_PATH}")
     print("🚀 Patent-worthy Spatial Consistency Analysis complete!")
-
-# ==================== INITIALIZE CLIP ====================
-print("🔄 Loading CLIP model...")
-clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
-    'ViT-H-14', 
-    pretrained='laion2b_s32b_b79k'
-)
-
-clip_model = clip_model.to(Config.DEVICE).eval()
-
-# Freeze CLIP parameters to prevent overfitting on small dataset
-for param in clip_model.parameters():
-    param.requires_grad = False
 
 if __name__ == '__main__':
     main()
