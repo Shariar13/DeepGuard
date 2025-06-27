@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Test DeepGuard using cosine similarity and soft voting.
@@ -31,6 +30,12 @@ means = {
     "eff": (data['real_mean_eff'], data['fake_mean_eff']),
 }
 
+expected_dims = {
+    "clip": means["clip"][0].shape[0],
+    "resnet": means["resnet"][0].shape[0],
+    "eff": means["eff"][0].shape[0]
+}
+
 # === NORMALIZERS ===
 clip_norm = transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
                                  [0.26862954, 0.26130258, 0.27577711])
@@ -56,7 +61,6 @@ def patches(img):
 def embed_image(img, clip_model, resnet, eff):
     vecs = {"clip": [], "resnet": [], "eff": []}
     for sz in resize_sizes:
-        # transforms
         tf_clip = build_tf(sz, clip_norm)
         tf_im = build_tf(sz, imagenet_norm)
 
@@ -64,16 +68,25 @@ def embed_image(img, clip_model, resnet, eff):
             p_clip = tf_clip(patch).unsqueeze(0).to(device)
             p_im = tf_im(patch).unsqueeze(0).to(device)
 
-            with torch.no_grad():
+            try:
                 v_clip = clip_model.encode_image(p_clip).squeeze(0)
                 v_res = resnet(p_im).squeeze(0)
                 v_eff = eff(p_im).squeeze(0)
 
-            vecs["clip"].append((v_clip / v_clip.norm()).cpu().numpy())
-            vecs["resnet"].append((v_res / v_res.norm()).cpu().numpy())
-            vecs["eff"].append((v_eff / v_eff.norm()).cpu().numpy())
+                vecs["clip"].append((v_clip / v_clip.norm()).cpu().numpy())
+                vecs["resnet"].append((v_res / v_res.norm()).cpu().numpy())
+                vecs["eff"].append((v_eff / v_eff.norm()).cpu().numpy())
+            except:
+                continue
 
-    return {k: np.mean(v, axis=0) for k,v in vecs.items() if v}
+    out = {}
+    for k in vecs:
+        if vecs[k]:
+            stacked = np.stack(vecs[k])
+            mean_vec = stacked.mean(0)
+            if mean_vec.shape[0] == expected_dims[k]:
+                out[k] = mean_vec
+    return out
 
 def predict(img_path, models):
     try:
@@ -84,11 +97,15 @@ def predict(img_path, models):
     emb = embed_image(img, *models)
     votes = []
     for k in means:
+        if k not in emb:
+            continue
         real_vec, fake_vec = means[k]
         sim_real = cosine_similarity([emb[k]], [real_vec])[0][0]
         sim_fake = cosine_similarity([emb[k]], [fake_vec])[0][0]
         votes.append(sim_real > sim_fake)
-    return int(sum(votes) >= 2)  # soft voting
+    if not votes:
+        return None
+    return int(sum(votes) >= 2)
 
 # === LOAD MODELS ===
 clip_model, _, _ = create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k", device=device)
