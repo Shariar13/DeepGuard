@@ -15,7 +15,7 @@ class Config:
     PATCHES = 4
     CLIP_MODEL = "ViT-B-32"
     CLIP_PRETRAINED = "laion2b_s34b_b79k"
-    THRESHOLD = 0.0  # Cosine distance threshold (auto-adjusted by class mean comparison)
+    MEAN_SAVE_PATH = "clip_means_v1.npz"
 
 # ==================== LOAD CLIP ====================
 clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
@@ -62,9 +62,17 @@ def build_class_mean(directory):
 
 # ==================== MAIN ====================
 def main():
-    print("\U0001F50D Building class means...")
-    real_mean = build_class_mean(Config.DATA_REAL)
-    fake_mean = build_class_mean(Config.DATA_FAKE)
+    if os.path.exists(Config.MEAN_SAVE_PATH):
+        print("✅ Loading existing class means from .npz file...")
+        means = np.load(Config.MEAN_SAVE_PATH)
+        real_mean = means["real"]
+        fake_mean = means["fake"]
+    else:
+        print("🔍 Building class means...")
+        real_mean = build_class_mean(Config.DATA_REAL)
+        fake_mean = build_class_mean(Config.DATA_FAKE)
+        np.savez(Config.MEAN_SAVE_PATH, real=real_mean, fake=fake_mean)
+        print(f"💾 Saved class means to {Config.MEAN_SAVE_PATH}")
 
     def predict(image_path):
         try:
@@ -77,7 +85,7 @@ def main():
         except:
             return -1
 
-    print("\U0001F4CA Validating...")
+    print("📊 Validating...")
     y_true, y_pred = [], []
     for label, folder in [(0, Config.DATA_REAL), (1, Config.DATA_FAKE)]:
         for fname in tqdm(os.listdir(folder), desc=f"Predicting {folder}"):
@@ -88,9 +96,9 @@ def main():
                 y_pred.append(pred)
 
     from sklearn.metrics import classification_report, confusion_matrix
-    print("\u2705 Report:")
+    print("✅ Report:")
     print(classification_report(y_true, y_pred, target_names=["Real", "Fake"]))
-    print("\U0001F9FE Confusion Matrix:")
+    print("🧾 Confusion Matrix:")
     print(confusion_matrix(y_true, y_pred))
 
 if __name__ == "__main__":
