@@ -1,119 +1,110 @@
-import os
-import numpy as np
+#!/usr/bin/env python3
+"""
+Generate mean-embedding .npz for DeepGuard (CLIP ViT-H/14 + ResNet-50 + EfficientNet-B0)
+Patch-wise (4) × multi-res (224,384,512) – pure cosine, zero-shot.
+"""
+
+import argparse, os, gc, json, numpy as np, torch
 from PIL import Image
 from tqdm import tqdm
-import torch
 from torchvision import transforms, models
 from open_clip import create_model_and_transforms
 
-# === CONFIG ===
-dataset_dir = "Dataset"  # Must contain 'real/' and 'fake/' folders
-output_npz = "deepguard_cosine_ensemble.npz"
-device = "cuda" if torch.cuda.is_available() else "cpu"
-resize_sizes = [224, 384, 512]
-
-# === LOAD MODELS ===
-clip_model, _, _ = create_model_and_transforms(
-    model_name="ViT-H-14",
-    pretrained="laion2b_s32b_b79k",
-    device=device
-)
-clip_model.eval()
-
-resnet = models.resnet50(pretrained=True).to(device)
-resnet.fc = torch.nn.Identity()
-resnet.eval()
-
-efficientnet = models.efficientnet_b0(pretrained=True).to(device)
-efficientnet.classifier = torch.nn.Identity()
-efficientnet.eval()
-
-# === TRANSFORMS ===
-clip_norm = transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
-                                 [0.26862954, 0.26130258, 0.27577711])
-imagenet_norm = transforms.Normalize([0.485, 0.456, 0.406],
-                                     [0.229, 0.224, 0.225])
-
-def get_transform(size, norm_type):
+# ------------------------------------------------------------
+# utility
+clip_norm = transforms.Normalize([0.48145466,0.4578275,0.40821073],
+                                 [0.26862954,0.26130258,0.27577711])
+imagenet_norm = transforms.Normalize([0.485,0.456,0.406],
+                                     [0.229,0.224,0.225])
+def build_tf(size, norm):
     return transforms.Compose([
-        transforms.Resize((size, size)),
+        transforms.Resize((size,size)),
         transforms.CenterCrop(size),
         transforms.ToTensor(),
-        clip_norm if norm_type == 'clip' else imagenet_norm
-    ])
+        norm])
 
-def split_into_patches(img):
-    w, h = img.size
+def patches(img):
+    w,h = img.size
     return [
-        img.crop((0, 0, w//2, h//2)),
-        img.crop((w//2, 0, w, h//2)),
-        img.crop((0, h//2, w//2, h)),
-        img.crop((w//2, h//2, w, h))
+        img.crop((0,0,w//2,h//2)), img.crop((w//2,0,w,h//2)),
+        img.crop((0,h//2,w//2,h)), img.crop((w//2,h//2,w,h))
     ]
 
 @torch.no_grad()
-def compute_embedding(img_path):
-    img = Image.open(img_path).convert("RGB")
-    emb_clip, emb_resnet, emb_eff = [], [], []
-
-    for size in resize_sizes:
-        resized = img.resize((size, size))
-        patches = split_into_patches(resized)
-        for patch in patches:
-            # CLIP
-            t_clip = get_transform(size, 'clip')(patch).unsqueeze(0).to(device)
-            e_clip = clip_model.encode_image(t_clip).squeeze(0)
-            emb_clip.append(e_clip / e_clip.norm())
-
-            # ResNet
-            t_imagenet = get_transform(size, 'imagenet')(patch).unsqueeze(0).to(device)
-            e_res = resnet(t_imagenet).squeeze(0)
-            emb_resnet.append(e_res / e_res.norm())
-
-            # EfficientNet
-            e_eff = efficientnet(t_imagenet).squeeze(0)
-            emb_eff.append(e_eff / e_eff.norm())
-
-    return {
-        "clip": torch.stack(emb_clip).mean(0).cpu().numpy(),
-        "resnet": torch.stack(emb_resnet).mean(0).cpu().numpy(),
-        "efficient": torch.stack(emb_eff).mean(0).cpu().numpy()
-    }
-
-def process_folder(path):
-    clip_list, res_list, eff_list = [], [], []
-    for fname in tqdm(os.listdir(path), desc=f"Processing {os.path.basename(path)}"):
-        fpath = os.path.join(path, fname)
+def embed_folder(backbone, prep_tf, folder, sizes, device):
+    """Return N×D matrix of embeddings for all files in `folder`."""
+    embs = []
+    for f in tqdm(os.listdir(folder), desc=f"→ {os.path.basename(folder)}"):
+        path = os.path.join(folder,f)
         try:
-            emb = compute_embedding(fpath)
-            clip_list.append(emb["clip"])
-            res_list.append(emb["resnet"])
-            eff_list.append(emb["efficient"])
-        except Exception as e:
-            print(f"⚠️ Skipped {fname}: {e}")
+            img = Image.open(path).convert("RGB")
+        except:                                  # unreadable file
             continue
-    return {
-        "clip": np.array(clip_list),
-        "resnet": np.array(res_list),
-        "efficient": np.array(eff_list)
+        vecs=[]
+        for sz in sizes:
+            tf = prep_tf(sz)
+            for p in patches(img.resize((sz,sz))):
+                v = backbone(tf(p).unsqueeze(0).to(device)).squeeze(0)
+                v = v/v.norm()
+                vecs.append(v.cpu())
+        embs.append(torch.stack(vecs).mean(0).numpy())
+    return np.vstack(embs)
+
+# ------------------------------------------------------------
+def main(args):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    res = [224,384,512]
+    real_dir = os.path.join(args.data,"real")
+    fake_dir = os.path.join(args.data,"fake")
+
+    # ---- pass 1: CLIP ViT-H/14 ---------------------------------
+    clip_model,_ ,_ = create_model_and_transforms("ViT-H-14",
+                               pretrained="laion2b_s32b_b79k",device=dev)
+    clip_model.eval(), clip_model.requires_grad_(False)
+    clip_embed = lambda tf: (lambda x: clip_model.encode_image(x))
+    tf_clip   = lambda s: build_tf(s, clip_norm)
+    real_clip = embed_folder(clip_embed(tf_clip), tf_clip, real_dir, res, dev)
+    fake_clip = embed_folder(clip_embed(tf_clip), tf_clip, fake_dir, res, dev)
+    del clip_model ; torch.cuda.empty_cache() ; gc.collect()
+
+    # ---- pass 2: ResNet-50 -------------------------------------
+    resnet = models.resnet50(weights="IMAGENET1K_V2").to(dev)
+    resnet.fc = torch.nn.Identity(); resnet.eval()
+    tf_im     = lambda s: build_tf(s, imagenet_norm)
+    real_res  = embed_folder(resnet, tf_im, real_dir, res, dev)
+    fake_res  = embed_folder(resnet, tf_im, fake_dir, res, dev)
+    del resnet; torch.cuda.empty_cache(); gc.collect()
+
+    # ---- pass 3: EfficientNet-B0 -------------------------------
+    eff = models.efficientnet_b0(weights="IMAGENET1K_V1").to(dev)
+    eff.classifier = torch.nn.Identity(); eff.eval()
+    real_eff = embed_folder(eff, tf_im, real_dir, res, dev)
+    fake_eff = embed_folder(eff, tf_im, fake_dir, res, dev)
+    del eff  ; torch.cuda.empty_cache(); gc.collect()
+
+    # ---- save --------------------------------------------------
+    np.savez(args.out,
+        real_mean_clip = real_clip.mean(0), fake_mean_clip = fake_clip.mean(0),
+        real_mean_res  = real_res.mean(0),  fake_mean_res  = fake_res.mean(0),
+        real_mean_eff  = real_eff.mean(0),  fake_mean_eff  = fake_eff.mean(0),
+        real_clip=real_clip, fake_clip=fake_clip,
+        real_res =real_res,  fake_res =fake_res,
+        real_eff =real_eff,  fake_eff=fake_eff)
+
+    print(f"\n\u2705 Saved {args.out}")
+    meta = {
+        "real": len(real_clip), "fake": len(fake_clip),
+        "dims": {"clip":real_clip.shape[1],
+                 "res" :real_res.shape[1],
+                 "eff" :real_eff.shape[1]},
+        "patches":4, "sizes":res
     }
+    with open(args.out.replace(".npz",".json"),"w") as jf:
+        json.dump(meta,jf,indent=2)
+    print("\ud83d\udcc4 metadata:", meta)
 
 if __name__ == "__main__":
-    real_data = process_folder(os.path.join(dataset_dir, "real"))
-    fake_data = process_folder(os.path.join(dataset_dir, "fake"))
-
-    np.savez(output_npz,
-             real_mean_clip=np.mean(real_data["clip"], axis=0),
-             fake_mean_clip=np.mean(fake_data["clip"], axis=0),
-             real_mean_resnet=np.mean(real_data["resnet"], axis=0),
-             fake_mean_resnet=np.mean(fake_data["resnet"], axis=0),
-             real_mean_efficient=np.mean(real_data["efficient"], axis=0),
-             fake_mean_efficient=np.mean(fake_data["efficient"], axis=0),
-             real_clip=real_data["clip"],
-             fake_clip=fake_data["clip"],
-             real_resnet=real_data["resnet"],
-             fake_resnet=fake_data["resnet"],
-             real_efficient=real_data["efficient"],
-             fake_efficient=fake_data["efficient"])
-
-    print(f"\n✅ .npz file saved: {output_npz}")
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", required=True, help="Dataset root with real/ & fake/")
+    p.add_argument("--out",  default="deepguard_cosine_ensemble.npz")
+    main(p.parse_args())
