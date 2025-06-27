@@ -1,99 +1,119 @@
-https://drive.google.com/file/d/1--JNrOUEAP8873ivzoqL8kihw92hwN02/view?usp=sharing
 import os
-import sys
 import numpy as np
 from PIL import Image
-import torch
-import open_clip
-from sklearn.metrics import classification_report, confusion_matrix
 from tqdm import tqdm
+import torch
+from torchvision import transforms, models
+from open_clip import create_model_and_transforms
 
+# === CONFIG ===
+dataset_dir = "Dataset"  # Must contain 'real/' and 'fake/' folders
+output_npz = "deepguard_cosine_ensemble.npz"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+resize_sizes = [224, 384, 512]
 
-class Config:
-    MEAN_PATH = "clip_means_v1.npz"
-    CLIP_MODEL = "ViT-B-32"
-    CLIP_PRETRAINED = "laion2b_s34b_b79k"
-    SIZES = [224, 256, 288]
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    TEST_REAL = "test/real"
-    TEST_FAKE = "test/fake"
+# === LOAD MODELS ===
+clip_model, _, _ = create_model_and_transforms(
+    model_name="ViT-H-14",
+    pretrained="laion2b_s32b_b79k",
+    device=device
+)
+clip_model.eval()
 
+resnet = models.resnet50(pretrained=True).to(device)
+resnet.fc = torch.nn.Identity()
+resnet.eval()
 
-def load_clip():
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        Config.CLIP_MODEL, pretrained=Config.CLIP_PRETRAINED
-    )
-    model = model.to(Config.DEVICE).eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    return model, preprocess
+efficientnet = models.efficientnet_b0(pretrained=True).to(device)
+efficientnet.classifier = torch.nn.Identity()
+efficientnet.eval()
 
+# === TRANSFORMS ===
+clip_norm = transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
+                                 [0.26862954, 0.26130258, 0.27577711])
+imagenet_norm = transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225])
 
-def extract_patches(image, size):
-    image = image.resize((size, size))
-    patch_size = size // 2
-    patches = []
-    for i in range(2):
-        for j in range(2):
-            box = (j * patch_size, i * patch_size, (j + 1) * patch_size, (i + 1) * patch_size)
-            patches.append(image.crop(box))
-    return patches
+def get_transform(size, norm_type):
+    return transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        clip_norm if norm_type == 'clip' else imagenet_norm
+    ])
 
+def split_into_patches(img):
+    w, h = img.size
+    return [
+        img.crop((0, 0, w//2, h//2)),
+        img.crop((w//2, 0, w, h//2)),
+        img.crop((0, h//2, w//2, h)),
+        img.crop((w//2, h//2, w, h))
+    ]
 
-def embed_image(img, model, preprocess):
-    embeddings = []
-    for size in Config.SIZES:
-        patches = extract_patches(img, size)
+@torch.no_grad()
+def compute_embedding(img_path):
+    img = Image.open(img_path).convert("RGB")
+    emb_clip, emb_resnet, emb_eff = [], [], []
+
+    for size in resize_sizes:
+        resized = img.resize((size, size))
+        patches = split_into_patches(resized)
         for patch in patches:
-            tensor = preprocess(patch).unsqueeze(0).to(Config.DEVICE)
-            with torch.no_grad():
-                emb = model.encode_image(tensor)
-                emb = torch.nn.functional.normalize(emb, dim=-1)
-                embeddings.append(emb.squeeze(0).cpu().numpy())
-    return np.vstack(embeddings)
+            # CLIP
+            t_clip = get_transform(size, 'clip')(patch).unsqueeze(0).to(device)
+            e_clip = clip_model.encode_image(t_clip).squeeze(0)
+            emb_clip.append(e_clip / e_clip.norm())
 
+            # ResNet
+            t_imagenet = get_transform(size, 'imagenet')(patch).unsqueeze(0).to(device)
+            e_res = resnet(t_imagenet).squeeze(0)
+            emb_resnet.append(e_res / e_res.norm())
 
-def load_class_means():
-    if not os.path.exists(Config.MEAN_PATH):
-        raise FileNotFoundError("Missing mean vectors. Run training script first.")
-    data = np.load(Config.MEAN_PATH)
-    return data["real"], data["fake"]
+            # EfficientNet
+            e_eff = efficientnet(t_imagenet).squeeze(0)
+            emb_eff.append(e_eff / e_eff.norm())
 
+    return {
+        "clip": torch.stack(emb_clip).mean(0).cpu().numpy(),
+        "resnet": torch.stack(emb_resnet).mean(0).cpu().numpy(),
+        "efficient": torch.stack(emb_eff).mean(0).cpu().numpy()
+    }
 
-def predict_image(img_path, model, preprocess, real_mean, fake_mean):
-    try:
-        img = Image.open(img_path).convert("RGB")
-    except Exception as e:
-        raise RuntimeError(f"Failed to open '{img_path}': {e}")
-    emb = embed_image(img, model, preprocess)
-    avg_emb = emb.mean(axis=0)
-    real_score = float(np.dot(avg_emb, real_mean))
-    fake_score = float(np.dot(avg_emb, fake_mean))
-    label = 0 if real_score > fake_score else 1
-    return label
-
-
-def main():
-    model, preprocess = load_clip()
-    real_mean, fake_mean = load_class_means()
-
-    y_true, y_pred = [], []
-    
-    for label, folder in [(0, Config.TEST_REAL), (1, Config.TEST_FAKE)]:
-        for fname in tqdm(os.listdir(folder), desc=f"Evaluating {folder}"):
-            fpath = os.path.join(folder, fname)
-            try:
-                pred = predict_image(fpath, model, preprocess, real_mean, fake_mean)
-                y_true.append(label)
-                y_pred.append(pred)
-            except Exception as e:
-                print(f"[WARN] Failed on {fname}: {e}", file=sys.stderr)
-
-    print("\n✅ Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=["Real", "Fake"]))
-    print("🧾 Confusion Matrix:")
-    print(confusion_matrix(y_true, y_pred))
-
+def process_folder(path):
+    clip_list, res_list, eff_list = [], [], []
+    for fname in tqdm(os.listdir(path), desc=f"Processing {os.path.basename(path)}"):
+        fpath = os.path.join(path, fname)
+        try:
+            emb = compute_embedding(fpath)
+            clip_list.append(emb["clip"])
+            res_list.append(emb["resnet"])
+            eff_list.append(emb["efficient"])
+        except Exception as e:
+            print(f"⚠️ Skipped {fname}: {e}")
+            continue
+    return {
+        "clip": np.array(clip_list),
+        "resnet": np.array(res_list),
+        "efficient": np.array(eff_list)
+    }
 
 if __name__ == "__main__":
-    main()
+    real_data = process_folder(os.path.join(dataset_dir, "real"))
+    fake_data = process_folder(os.path.join(dataset_dir, "fake"))
+
+    np.savez(output_npz,
+             real_mean_clip=np.mean(real_data["clip"], axis=0),
+             fake_mean_clip=np.mean(fake_data["clip"], axis=0),
+             real_mean_resnet=np.mean(real_data["resnet"], axis=0),
+             fake_mean_resnet=np.mean(fake_data["resnet"], axis=0),
+             real_mean_efficient=np.mean(real_data["efficient"], axis=0),
+             fake_mean_efficient=np.mean(fake_data["efficient"], axis=0),
+             real_clip=real_data["clip"],
+             fake_clip=fake_data["clip"],
+             real_resnet=real_data["resnet"],
+             fake_resnet=fake_data["resnet"],
+             real_efficient=real_data["efficient"],
+             fake_efficient=fake_data["efficient"])
+
+    print(f"\n✅ .npz file saved: {output_npz}")
