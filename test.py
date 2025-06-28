@@ -3,16 +3,21 @@ import numpy as np
 from scipy.signal import correlate2d
 import argparse
 import os
+import time
+from skimage.restoration import denoise_wavelet
 
 def extract_prnu(image_path, resize_dim=(512, 512)):
-    """Extract a simple PRNU (noise residual) from a grayscale image."""
+    """Extract a more advanced PRNU (noise residual) from a grayscale image using wavelet denoising."""
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"Could not load image: {image_path}")
 
-    img = cv2.resize(img, resize_dim)
-    denoised = cv2.fastNlMeansDenoising(img, h=10)
-    noise_residual = img.astype(np.float32) - denoised.astype(np.float32)
+    img = cv2.resize(img, resize_dim).astype(np.float32) / 255.0
+
+    # Apply wavelet denoising to simulate high-frequency removal
+    denoised = denoise_wavelet(img, multichannel=False, convert2ycbcr=False, rescale_sigma=True)
+    denoised = np.clip(denoised, 0, 1)
+    noise_residual = img - denoised
     return noise_residual
 
 def compute_prnu_score(noise_residual):
@@ -40,6 +45,8 @@ def main():
         return
 
     print(f"[INFO] Analyzing: {image_path}")
+    start_time = time.time()
+
     try:
         prnu_residual = extract_prnu(image_path)
         prnu_score = compute_prnu_score(prnu_residual)
@@ -50,6 +57,8 @@ def main():
 
     except Exception as e:
         print(f"[ERROR] Failed to process image: {str(e)}")
+
+    print(f"[INFO] Total time: {time.time() - start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()
