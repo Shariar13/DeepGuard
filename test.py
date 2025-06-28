@@ -1,133 +1,55 @@
-#!/usr/bin/env python3
-"""
-Test DeepGuard using cosine similarity and soft voting.
-Folder structure:
-  test/
-    real/
-    fake/
-Usage:
-  python test.py
-"""
+import cv2
+import numpy as np
+from scipy.signal import correlate2d
+import argparse
+import os
 
-import os, numpy as np, torch
-from PIL import Image
-from tqdm import tqdm
-from torchvision import transforms, models
-from open_clip import create_model_and_transforms
-from sklearn.metrics.pairwise import cosine_similarity
+def extract_prnu(image_path, resize_dim=(512, 512)):
+    """Extract a simple PRNU (noise residual) from a grayscale image."""
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Could not load image: {image_path}")
 
-# === CONFIG ===
-npz_file = "deepguard_cosine_ensemble.npz"
-test_root = "test"
-resize_sizes = [224, 384, 512]
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    img = cv2.resize(img, resize_dim)
+    denoised = cv2.fastNlMeansDenoising(img, h=10)
+    noise_residual = img.astype(np.float32) - denoised.astype(np.float32)
+    return noise_residual
 
-# === LOAD EMBEDDINGS ===
-data = np.load(npz_file)
-means = {
-    "clip": (data['real_mean_clip'], data['fake_mean_clip']),
-    "resnet": (data['real_mean_res'], data['fake_mean_res']),
-    "eff": (data['real_mean_eff'], data['fake_mean_eff']),
-}
+def compute_prnu_score(noise_residual):
+    """Compute the self-correlation PRNU score from the noise residual."""
+    corr = correlate2d(noise_residual, noise_residual, mode='same')
+    center = corr.shape[0] // 2
+    score = corr[center, center] / np.max(corr)
+    return float(score)
 
-expected_dims = {
-    "clip": means["clip"][0].shape[0],
-    "resnet": means["resnet"][0].shape[0],
-    "eff": means["eff"][0].shape[0]
-}
+def classify_by_prnu(score, threshold=0.95):
+    """Classify image as real or fake based on PRNU score."""
+    if score >= threshold:
+        return "REAL (Strong PRNU detected)"
+    else:
+        return "FAKE or Weak PRNU"
 
-# === NORMALIZERS ===
-clip_norm = transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
-                                 [0.26862954, 0.26130258, 0.27577711])
-imagenet_norm = transforms.Normalize([0.485, 0.456, 0.406],
-                                     [0.229, 0.224, 0.225])
+def main():
+    parser = argparse.ArgumentParser(description="PRNU-based Real/Fake Image Classifier")
+    parser.add_argument("image", help="Path to the image file")
+    args = parser.parse_args()
 
-def build_tf(size, norm):
-    return transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.CenterCrop(size),
-        transforms.ToTensor(),
-        norm
-    ])
+    image_path = args.image
+    if not os.path.isfile(image_path):
+        print(f"[ERROR] File not found: {image_path}")
+        return
 
-def patches(img):
-    w, h = img.size
-    return [
-        img.crop((0, 0, w//2, h//2)), img.crop((w//2, 0, w, h//2)),
-        img.crop((0, h//2, w//2, h)), img.crop((w//2, h//2, w, h))
-    ]
-
-@torch.no_grad()
-def embed_image(img, clip_model, resnet, eff):
-    vecs = {"clip": [], "resnet": [], "eff": []}
-    for sz in resize_sizes:
-        tf_clip = build_tf(sz, clip_norm)
-        tf_im = build_tf(sz, imagenet_norm)
-
-        for patch in patches(img.resize((sz, sz))):
-            p_clip = tf_clip(patch).unsqueeze(0).to(device)
-            p_im = tf_im(patch).unsqueeze(0).to(device)
-
-            try:
-                v_clip = clip_model.encode_image(p_clip).squeeze(0)
-                v_res = resnet(p_im).squeeze(0)
-                v_eff = eff(p_im).squeeze(0)
-
-                vecs["clip"].append((v_clip / v_clip.norm()).cpu().numpy())
-                vecs["resnet"].append((v_res / v_res.norm()).cpu().numpy())
-                vecs["eff"].append((v_eff / v_eff.norm()).cpu().numpy())
-            except:
-                continue
-
-    out = {}
-    for k in vecs:
-        if vecs[k]:
-            stacked = np.stack(vecs[k])
-            mean_vec = stacked.mean(0)
-            if mean_vec.shape[0] == expected_dims[k]:
-                out[k] = mean_vec
-    return out
-
-def predict(img_path, models):
+    print(f"[INFO] Analyzing: {image_path}")
     try:
-        img = Image.open(img_path).convert("RGB")
-    except:
-        return None
+        prnu_residual = extract_prnu(image_path)
+        prnu_score = compute_prnu_score(prnu_residual)
+        classification = classify_by_prnu(prnu_score)
 
-    emb = embed_image(img, *models)
-    votes = []
-    for k in means:
-        if k not in emb:
-            continue
-        real_vec, fake_vec = means[k]
-        sim_real = cosine_similarity([emb[k]], [real_vec])[0][0]
-        sim_fake = cosine_similarity([emb[k]], [fake_vec])[0][0]
-        votes.append(sim_real > sim_fake)
-    if not votes:
-        return None
-    return int(sum(votes) >= 2)
+        print(f"[RESULT] PRNU Score: {prnu_score:.4f}")
+        print(f"[RESULT] Classification: {classification}")
 
-# === LOAD MODELS ===
-clip_model, _, _ = create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k", device=device)
-clip_model.eval().requires_grad_(False)
+    except Exception as e:
+        print(f"[ERROR] Failed to process image: {str(e)}")
 
-resnet = models.resnet50(weights="IMAGENET1K_V2").to(device)
-resnet.fc = torch.nn.Identity(); resnet.eval()
-
-eff = models.efficientnet_b0(weights="IMAGENET1K_V1").to(device)
-eff.classifier = torch.nn.Identity(); eff.eval()
-
-# === TEST LOOP ===
-correct, total = 0, 0
-for label in ["real", "fake"]:
-    folder = os.path.join(test_root, label)
-    y_true = 0 if label == "real" else 1
-    for fname in tqdm(os.listdir(folder), desc=f"Testing {label}"):
-        path = os.path.join(folder, fname)
-        pred = predict(path, (clip_model, resnet, eff))
-        if pred is None:
-            continue
-        total += 1
-        correct += int(pred == y_true)
-
-print(f"\n✅ Accuracy: {correct}/{total} = {correct/total:.2%}")
+if __name__ == "__main__":
+    main()
