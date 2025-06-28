@@ -1,129 +1,102 @@
-#!/usr/bin/env python3
-"""
-DeepGuard zero-shot generator with CLIP ViT-H/14, ResNet-50, EfficientNet-B0.
-Run as:
-    python train.py
-Generates: deepguard_cosine_ensemble.npz
-"""
+# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenCLIP Version)
 
-import os, gc, json, numpy as np, torch
+import os
+import torch
+import open_clip
+import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms, models
-from open_clip import create_model_and_transforms
 
-# === CONFIG ===
-dataset_dir = "Dataset"
-output_file = "deepguard_cosine_ensemble.npz"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-resize_sizes = [224, 384, 512]
+# ------------------ Configuration ------------------ #
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATA_DIR = ""
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+REAL_CLASS = "Real"
+MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
+IMG_LIMIT_PER_CLASS = 200
+MARGIN_THRESHOLD = 0.009
 
-# === NORMALIZERS ===
-clip_norm = transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
-                                 [0.26862954, 0.26130258, 0.27577711])
-imagenet_norm = transforms.Normalize([0.485, 0.456, 0.406],
-                                     [0.229, 0.224, 0.225])
+# ------------------ Compute Mean Vectors ------------------ #
+def compute_class_means():
+    print("🚀 Loading OpenCLIP model...")
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    model = model.to(DEVICE)
+    model.eval()
 
-def build_tf(size, norm):
-    return transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.CenterCrop(size),
-        transforms.ToTensor(),
-        norm
-    ])
+    real_feats, fake_feats = [], []
 
-def patches(img):
-    w, h = img.size
-    return [
-        img.crop((0, 0, w//2, h//2)), img.crop((w//2, 0, w, h//2)),
-        img.crop((0, h//2, w//2, h)), img.crop((w//2, h//2, w, h))
-    ]
+    print("📊 Extracting image embeddings for mean computation...")
+    with torch.no_grad():
+        for cls_name in sorted(os.listdir(TRAIN_DIR)):
+            cls_path = os.path.join(TRAIN_DIR, cls_name)
+            label = 1 if cls_name == REAL_CLASS else 0
+            count = 0
 
-@torch.no_grad()
-def embed_folder(model, tf_fn, folder, sizes):
-    embs = []
-    for f in tqdm(os.listdir(folder), desc=f"→ {os.path.basename(folder)}"):
-        path = os.path.join(folder, f)
-        try:
-            img = Image.open(path).convert("RGB")
-        except:
-            continue
-        vecs = []
-        for sz in sizes:
-            tf = tf_fn(sz)
-            for p in patches(img.resize((sz, sz))):
+            for fname in tqdm(os.listdir(cls_path), desc=f"{cls_name}"):
+                if count >= IMG_LIMIT_PER_CLASS:
+                    break
                 try:
-                    v = model(tf(p).unsqueeze(0).to(device)).squeeze(0)
-                    v = v / v.norm()
-                    vecs.append(v.cpu())
-                except:
+                    img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
+                    img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+                    feat = model.encode_image(img_tensor)
+                    feat /= feat.norm(dim=-1, keepdim=True)
+                    if label == 1:
+                        real_feats.append(feat.cpu().numpy())
+                    else:
+                        fake_feats.append(feat.cpu().numpy())
+                    count += 1
+                except Exception:
                     continue
-        if vecs:
-            try:
-                embs.append(torch.stack(vecs).mean(0).numpy())
-            except:
-                continue
-    return np.vstack(embs)
 
-# === MAIN EXECUTION ===
-def main():
-    real_dir = os.path.join(dataset_dir, "real")
-    fake_dir = os.path.join(dataset_dir, "fake")
+    real_mean = np.mean(np.vstack(real_feats), axis=0)
+    fake_mean = np.mean(np.vstack(fake_feats), axis=0)
+    np.savez(MEAN_VECTOR_PATH, real=real_mean, fake=fake_mean)
+    print(f"✅ Mean vectors saved to: {MEAN_VECTOR_PATH}")
 
-    # CLIP ViT-H/14
-    clip_model, _, _ = create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k", device=device)
-    clip_model.eval().requires_grad_(False)
-    clip_enc = lambda x: clip_model.encode_image(x)
-    tf_clip = lambda s: build_tf(s, clip_norm)
-    real_clip = embed_folder(clip_enc, tf_clip, real_dir, resize_sizes)
-    fake_clip = embed_folder(clip_enc, tf_clip, fake_dir, resize_sizes)
-    del clip_model; torch.cuda.empty_cache(); gc.collect()
+# ------------------ Predict Function ------------------ #
+def predict_image(image_path):
+    print(f"📷 Loading image: {image_path}")
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    model = model.to(DEVICE)
+    model.eval()
 
-    # ResNet-50
-    resnet = models.resnet50(weights="IMAGENET1K_V2").to(device)
-    resnet.fc = torch.nn.Identity(); resnet.eval()
-    tf_im = lambda s: build_tf(s, imagenet_norm)
-    real_res = embed_folder(resnet, tf_im, real_dir, resize_sizes)
-    fake_res = embed_folder(resnet, tf_im, fake_dir, resize_sizes)
-    del resnet; torch.cuda.empty_cache(); gc.collect()
+    means = np.load(MEAN_VECTOR_PATH)
+    mean_real = torch.tensor(means['real'], dtype=torch.float32).to(DEVICE)
+    mean_fake = torch.tensor(means['fake'], dtype=torch.float32).to(DEVICE)
 
-    # EfficientNet-B0
-    eff = models.efficientnet_b0(weights="IMAGENET1K_V1").to(device)
-    eff.classifier = torch.nn.Identity(); eff.eval()
-    real_eff = embed_folder(eff, tf_im, real_dir, resize_sizes)
-    fake_eff = embed_folder(eff, tf_im, fake_dir, resize_sizes)
-    del eff; torch.cuda.empty_cache(); gc.collect()
+    with torch.no_grad():
+        try:
+            img = Image.open(image_path).convert("RGB")
+            img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+            img_feat = model.encode_image(img_tensor)
+            img_feat /= img_feat.norm(dim=-1, keepdim=True)
+        except Exception as e:
+            print(f"❌ Failed to process image: {e}")
+            return
 
-    # SAVE NPZ
-    np.savez(output_file,
-             real_mean_clip = real_clip.mean(0),
-             fake_mean_clip = fake_clip.mean(0),
-             real_mean_res = real_res.mean(0),
-             fake_mean_res = fake_res.mean(0),
-             real_mean_eff = real_eff.mean(0),
-             fake_mean_eff = fake_eff.mean(0),
-             real_clip = real_clip,
-             fake_clip = fake_clip,
-             real_res = real_res,
-             fake_res = fake_res,
-             real_eff = real_eff,
-             fake_eff = fake_eff)
+    sim_real = torch.cosine_similarity(img_feat, mean_real.unsqueeze(0)).item()
+    sim_fake = torch.cosine_similarity(img_feat, mean_fake.unsqueeze(0)).item()
+    margin = abs(sim_real - sim_fake)
 
-    print(f"\n✅ Saved: {output_file}")
-    meta = {
-        "real": len(real_clip),
-        "fake": len(fake_clip),
-        "dims": {
-            "clip": real_clip.shape[1],
-            "resnet": real_res.shape[1],
-            "efficientnet": real_eff.shape[1]
-        },
-        "patches": 4,
-        "sizes": resize_sizes
-    }
-    with open(output_file.replace(".npz", ".json"), "w") as jf:
-        json.dump(meta, jf, indent=2)
-    print("📄 Metadata:", meta)
+    if sim_real > sim_fake and margin < MARGIN_THRESHOLD:
+        label = "FAKE"
+    elif sim_fake > sim_real and margin < MARGIN_THRESHOLD:
+        label = "REAL"
+    else:
+        label = "REAL" if sim_real > sim_fake else "FAKE"
 
-if __name__ == "__main__":
-    main()
+    conf = max(sim_real, sim_fake) * 100
+    print(f"🔍 Cosine Similarity - Real: {sim_real:.4f}, Fake: {sim_fake:.4f}, Margin: {margin:.4f}")
+    print(f"✅ Prediction: {label} ({conf:.2f}% confident)")
+
+# ------------------ CLI ------------------ #
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) == 2 and sys.argv[1] == "build":
+        compute_class_means()
+    elif len(sys.argv) == 2:
+        predict_image(sys.argv[1])
+    else:
+        print("❌ Usage:")
+        print("   python clip_distance_classifier_openclip.py build          # to compute mean vectors")
+        print("   python clip_distance_classifier_openclip.py <image_path>  # to predict image")
