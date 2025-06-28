@@ -1,4 +1,4 @@
-# clip_distance_classifier.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Commercial-Safe, No Filtering)
+# clip_distance_classifier.py — Commercial-Safe, Balanced CLIP Real vs Fake Classifier (OpenCLIP)
 
 import os
 import torch
@@ -9,12 +9,19 @@ import open_clip
 
 # ------------------ Configuration ------------------ #
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "dataset"
-REAL_CLASS = "Real"
+DATA_DIR = "data"  # Updated dataset structure: data/real and data/fake
+REAL_FOLDER = "real"
+FAKE_FOLDER = "fake"
 MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
 IMG_LIMIT_PER_CLASS = 200
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
+SEED = 42
+
+# ------------------ Seed Fix for Reproducibility ------------------ #
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ------------------ Compute Mean Vectors ------------------ #
 def compute_class_means():
@@ -23,32 +30,24 @@ def compute_class_means():
     model.to(DEVICE).eval()
 
     real_feats, fake_feats = [], []
+
     print("📊 Extracting embeddings...")
-
     with torch.no_grad():
-        for split in ["train", "val"]:
-            split_dir = os.path.join(DATA_DIR, split)
-            for cls_name in sorted(os.listdir(split_dir)):
-                cls_path = os.path.join(split_dir, cls_name)
-                label = 1 if cls_name == REAL_CLASS else 0
-                count = 0
-
-                for fname in tqdm(os.listdir(cls_path), desc=f"{split}/{cls_name}"):
-                    if count >= IMG_LIMIT_PER_CLASS:
-                        break
-                    try:
-                        img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
-                        img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
-                        feat = model.encode_image(img_tensor)
-                        feat /= feat.norm(dim=-1, keepdim=True)
-
-                        if label == 1:
-                            real_feats.append(feat.cpu().numpy())
-                        else:
-                            fake_feats.append(feat.cpu().numpy())
-                        count += 1
-                    except Exception:
-                        continue
+        for label_name, storage, max_img in [(REAL_FOLDER, real_feats, IMG_LIMIT_PER_CLASS), (FAKE_FOLDER, fake_feats, IMG_LIMIT_PER_CLASS)]:
+            path = os.path.join(DATA_DIR, label_name)
+            count = 0
+            for fname in tqdm(os.listdir(path), desc=label_name):
+                if count >= max_img:
+                    break
+                try:
+                    img = Image.open(os.path.join(path, fname)).convert("RGB")
+                    img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+                    feat = model.encode_image(img_tensor)
+                    feat /= feat.norm(dim=-1, keepdim=True)
+                    storage.append(feat.cpu().numpy())
+                    count += 1
+                except Exception:
+                    continue
 
     if not real_feats or not fake_feats:
         print(f"❌ ERROR: Empty feature list — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
@@ -85,7 +84,7 @@ def predict_image(image_path):
 
     label = "REAL" if sim_real > sim_fake else "FAKE"
     conf = max(sim_real, sim_fake) * 100
-    print(f"🔍 Cosine Similarity - Real: {sim_real:.4f}, Fake: {sim_fake:.4f}")
+    print(f"🔍 Cosine Similarity — Real: {sim_real:.4f}, Fake: {sim_fake:.4f}")
     print(f"✅ Prediction: {label} ({conf:.2f}% confident)")
 
 # ------------------ CLI ------------------ #
