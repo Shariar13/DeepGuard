@@ -1,58 +1,70 @@
-# clip_distance_classifier_openai.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Original OpenAI CLIP)
+# clip_distance_classifier.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Commercial-Safe + Alignment Check)
 
 import os
 import torch
-import clip
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import open_clip
 
 # ------------------ Configuration ------------------ #
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = ""
-TRAIN_DIR = os.path.join(DATA_DIR, "train")
+DATA_DIR = "dataset"
 REAL_CLASS = "Real"
 MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
-FAKE_IMG_LIMIT_PER_CLASS = 200
-REAL_IMG_LIMIT_TOTAL = 1000
-MARGIN_THRESHOLD = 0.009
+IMG_LIMIT_PER_CLASS = 200
+MODEL_NAME = "ViT-B-32"
+PRETRAINED = "laion2b_s34b_b79k"
 
-# ------------------ Load Model ------------------ #
-clip_model, clip_preprocess = clip.load("ViT-B/32", device=DEVICE)
-clip_model.eval()
-
-# ------------------ Compute Mean Vectors ------------------ #
+# ------------------ Compute Mean Vectors with Alignment Filtering ------------------ #
 def compute_class_means():
+    print("🚀 Loading OpenCLIP model...")
+    model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
+    model.to(DEVICE).eval()
+
     real_feats, fake_feats = [], []
-    real_img_count = 0
+    print("📊 Extracting and aligning embeddings...")
 
-    print("📊 Extracting image embeddings for mean computation...")
     with torch.no_grad():
-        for cls_name in sorted(os.listdir(TRAIN_DIR)):
-            cls_path = os.path.join(TRAIN_DIR, cls_name)
-            is_real = cls_name == REAL_CLASS
-            count = 0
+        for split in ["train", "val"]:
+            split_dir = os.path.join(DATA_DIR, split)
+            for cls_name in sorted(os.listdir(split_dir)):
+                cls_path = os.path.join(split_dir, cls_name)
+                label = 1 if cls_name == REAL_CLASS else 0
+                count = 0
 
-            for fname in tqdm(os.listdir(cls_path), desc=f"{cls_name}"):
-                if is_real and real_img_count >= REAL_IMG_LIMIT_TOTAL:
-                    break
-                if not is_real and count >= FAKE_IMG_LIMIT_PER_CLASS:
-                    break
+                for fname in tqdm(os.listdir(cls_path), desc=f"{split}/{cls_name}"):
+                    if count >= IMG_LIMIT_PER_CLASS:
+                        break
+                    try:
+                        img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
+                        img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+                        feat = model.encode_image(img_tensor)
+                        feat /= feat.norm(dim=-1, keepdim=True)
 
-                try:
-                    img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
-                    img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
-                    feat = clip_model.encode_image(img_tensor)
-                    feat /= feat.norm(dim=-1, keepdim=True)
-                    if is_real:
-                        real_feats.append(feat.cpu().numpy())
-                        real_img_count += 1
-                    else:
-                        fake_feats.append(feat.cpu().numpy())
-                        count += 1
-                except Exception:
-                    continue
+                        # Temporary candidate pool
+                        if label == 1:
+                            temp_real_feats = real_feats + [feat.cpu().numpy()]
+                            temp_real_mean = np.mean(np.vstack(temp_real_feats), axis=0)
+                            sim_real = torch.cosine_similarity(feat, torch.tensor(temp_real_mean).to(DEVICE).unsqueeze(0)).item()
+                            if sim_real > 0.6:
+                                real_feats.append(feat.cpu().numpy())
+                                count += 1
+                        else:
+                            temp_fake_feats = fake_feats + [feat.cpu().numpy()]
+                            temp_fake_mean = np.mean(np.vstack(temp_fake_feats), axis=0) if fake_feats else feat.cpu().numpy()
+                            sim_fake = torch.cosine_similarity(feat, torch.tensor(temp_fake_mean).to(DEVICE).unsqueeze(0)).item()
+                            if sim_fake > 0.6:
+                                fake_feats.append(feat.cpu().numpy())
+                                count += 1
+                    except Exception:
+                        continue
 
+    if not real_feats or not fake_feats:
+        print(f"❌ ERROR: Empty feature list — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
+        return
+
+    print(f"📦 Final Aligned Feature Counts — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
     real_mean = np.mean(np.vstack(real_feats), axis=0)
     fake_mean = np.mean(np.vstack(fake_feats), axis=0)
     np.savez(MEAN_VECTOR_PATH, real=real_mean, fake=fake_mean)
@@ -61,6 +73,8 @@ def compute_class_means():
 # ------------------ Predict Function ------------------ #
 def predict_image(image_path):
     print(f"📷 Loading image: {image_path}")
+    model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
+    model.to(DEVICE).eval()
 
     means = np.load(MEAN_VECTOR_PATH)
     mean_real = torch.tensor(means['real'], dtype=torch.float32).to(DEVICE)
@@ -69,8 +83,8 @@ def predict_image(image_path):
     with torch.no_grad():
         try:
             img = Image.open(image_path).convert("RGB")
-            img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
-            img_feat = clip_model.encode_image(img_tensor)
+            img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+            img_feat = model.encode_image(img_tensor)
             img_feat /= img_feat.norm(dim=-1, keepdim=True)
         except Exception as e:
             print(f"❌ Failed to process image: {e}")
@@ -78,17 +92,10 @@ def predict_image(image_path):
 
     sim_real = torch.cosine_similarity(img_feat, mean_real.unsqueeze(0)).item()
     sim_fake = torch.cosine_similarity(img_feat, mean_fake.unsqueeze(0)).item()
-    margin = abs(sim_real - sim_fake)
 
-    if sim_real > sim_fake and margin < MARGIN_THRESHOLD:
-        label = "FAKE"
-    elif sim_fake > sim_real and margin < MARGIN_THRESHOLD:
-        label = "REAL"
-    else:
-        label = "REAL" if sim_real > sim_fake else "FAKE"
-
+    label = "REAL" if sim_real > sim_fake else "FAKE"
     conf = max(sim_real, sim_fake) * 100
-    print(f"🔍 Cosine Similarity - Real: {sim_real:.4f}, Fake: {sim_fake:.4f}, Margin: {margin:.4f}")
+    print(f"🔍 Cosine Similarity - Real: {sim_real:.4f}, Fake: {sim_fake:.4f}")
     print(f"✅ Prediction: {label} ({conf:.2f}% confident)")
 
 # ------------------ CLI ------------------ #
@@ -100,5 +107,5 @@ if __name__ == '__main__':
         predict_image(sys.argv[1])
     else:
         print("❌ Usage:")
-        print("   python clip_distance_classifier_openai.py build          # to compute mean vectors")
-        print("   python clip_distance_classifier_openai.py <image_path>  # to predict image")
+        print("   python clip_distance_classifier.py build          # to compute mean vectors")
+        print("   python clip_distance_classifier.py <image_path>  # to predict image")
