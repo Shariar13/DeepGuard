@@ -1,12 +1,11 @@
-# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenAI CLIP Style with EVA-CLIP Backend)
+# clip_distance_classifier_openai.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Original OpenAI CLIP)
 
 import os
 import torch
-import open_clip
+import clip
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms
 
 # ------------------ Configuration ------------------ #
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -18,24 +17,12 @@ FAKE_IMG_LIMIT_PER_CLASS = 200
 REAL_IMG_LIMIT_TOTAL = 1000
 MARGIN_THRESHOLD = 0.009
 
-# ------------------ Preprocessing (match OpenAI CLIP) ------------------ #
-clip_preprocess = transforms.Compose([
-    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=(0.48145466, 0.4578275, 0.40821073),
-        std=(0.26862954, 0.26130258, 0.27577711)
-    )
-])
+# ------------------ Load Model ------------------ #
+clip_model, clip_preprocess = clip.load("ViT-B/32", device=DEVICE)
+clip_model.eval()
 
 # ------------------ Compute Mean Vectors ------------------ #
 def compute_class_means():
-    print("🚀 Loading EVA-CLIP model (OpenCLIP backend)...")
-    model, _, _ = open_clip.create_model_and_transforms("EVA02-B-32", pretrained="eva02_B_psz14_plus")
-    model = model.to(DEVICE)
-    model.eval()
-
     real_feats, fake_feats = [], []
     real_img_count = 0
 
@@ -55,7 +42,7 @@ def compute_class_means():
                 try:
                     img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
                     img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
-                    feat = model.encode_image(img_tensor)
+                    feat = clip_model.encode_image(img_tensor)
                     feat /= feat.norm(dim=-1, keepdim=True)
                     if is_real:
                         real_feats.append(feat.cpu().numpy())
@@ -74,9 +61,6 @@ def compute_class_means():
 # ------------------ Predict Function ------------------ #
 def predict_image(image_path):
     print(f"📷 Loading image: {image_path}")
-    model, _, _ = open_clip.create_model_and_transforms("EVA02-B-32", pretrained="eva02_B_psz14_plus")
-    model = model.to(DEVICE)
-    model.eval()
 
     means = np.load(MEAN_VECTOR_PATH)
     mean_real = torch.tensor(means['real'], dtype=torch.float32).to(DEVICE)
@@ -86,7 +70,7 @@ def predict_image(image_path):
         try:
             img = Image.open(image_path).convert("RGB")
             img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
-            img_feat = model.encode_image(img_tensor)
+            img_feat = clip_model.encode_image(img_tensor)
             img_feat /= img_feat.norm(dim=-1, keepdim=True)
         except Exception as e:
             print(f"❌ Failed to process image: {e}")
@@ -116,5 +100,5 @@ if __name__ == '__main__':
         predict_image(sys.argv[1])
     else:
         print("❌ Usage:")
-        print("   python clip_distance_classifier_openclip.py build          # to compute mean vectors")
-        print("   python clip_distance_classifier_openclip.py <image_path>  # to predict image")
+        print("   python clip_distance_classifier_openai.py build          # to compute mean vectors")
+        print("   python clip_distance_classifier_openai.py <image_path>  # to predict image")
