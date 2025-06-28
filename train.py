@@ -1,4 +1,4 @@
-# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenCLIP Version)
+# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenCLIP Version with OpenAI-style Preprocessing)
 
 import os
 import torch
@@ -6,6 +6,7 @@ import open_clip
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+from torchvision import transforms
 
 # ------------------ Configuration ------------------ #
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -16,10 +17,21 @@ MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
 IMG_LIMIT_PER_CLASS = 200
 MARGIN_THRESHOLD = 0.009
 
+# ------------------ Preprocessing (match OpenAI CLIP) ------------------ #
+clip_preprocess = transforms.Compose([
+    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=(0.48145466, 0.4578275, 0.40821073),
+        std=(0.26862954, 0.26130258, 0.27577711)
+    )
+])
+
 # ------------------ Compute Mean Vectors ------------------ #
 def compute_class_means():
     print("🚀 Loading OpenCLIP model...")
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion400m_e32")
     model = model.to(DEVICE)
     model.eval()
 
@@ -37,7 +49,7 @@ def compute_class_means():
                     break
                 try:
                     img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
-                    img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+                    img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
                     feat = model.encode_image(img_tensor)
                     feat /= feat.norm(dim=-1, keepdim=True)
                     if label == 1:
@@ -56,7 +68,7 @@ def compute_class_means():
 # ------------------ Predict Function ------------------ #
 def predict_image(image_path):
     print(f"📷 Loading image: {image_path}")
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion400m_e32")
     model = model.to(DEVICE)
     model.eval()
 
@@ -67,7 +79,7 @@ def predict_image(image_path):
     with torch.no_grad():
         try:
             img = Image.open(image_path).convert("RGB")
-            img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
+            img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
             img_feat = model.encode_image(img_tensor)
             img_feat /= img_feat.norm(dim=-1, keepdim=True)
         except Exception as e:
