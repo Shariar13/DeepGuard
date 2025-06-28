@@ -15,7 +15,7 @@ def extract_prnu(image_path, resize_dim=(512, 512)):
     img = cv2.resize(img, resize_dim).astype(np.float32) / 255.0
 
     # Apply wavelet denoising to simulate high-frequency removal
-    denoised = denoise_wavelet(img, multichannel=False, convert2ycbcr=False, rescale_sigma=True)
+    denoised = denoise_wavelet(img, channel_axis=None, rescale_sigma=True)
     denoised = np.clip(denoised, 0, 1)
     noise_residual = img - denoised
     return noise_residual
