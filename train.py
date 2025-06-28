@@ -1,119 +1,106 @@
-# clip_distance_classifier.py — Commercial-Safe, Balanced CLIP Real vs Fake Classifier (OpenCLIP + Clean Filtering)
+# RealGuard v3.0: Robust AI vs Real Image Detector
+# Dataset: DeepGuardDB/train/real and DeepGuardDB/train/fake
+# License-Free, Real-World Ready, Patch-Consistent, CLIP+Forensic Fusion
 
 import os
-import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-import open_clip
 
-# ------------------ Configuration ------------------ #
+import torch
+import torchvision.transforms as T
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+from open_clip import create_model_and_transforms
+import cv2
+import joblib
+
+# === SETUP === #
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "data"  # Updated dataset structure: data/real and data/fake
-REAL_FOLDER = "real"
-FAKE_FOLDER = "fake"
-MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
-IMG_LIMIT_PER_CLASS = 200
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
-SEED = 42
 
-# ------------------ Seed Fix for Reproducibility ------------------ #
-torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+model, preprocess, _ = create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
+model = model.to(DEVICE).eval()
 
-# ------------------ Compute Clean Mean Vectors ------------------ #
-def compute_class_means():
-    print("🚀 Loading OpenCLIP model...")
-    model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
-    model.to(DEVICE).eval()
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.4815, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2758])
+])
 
-    all_feats = []
-    all_labels = []
-
-    print("📊 Step 1: Gathering all embeddings...")
+# === FEATURE EXTRACTORS === #
+def extract_clip_embedding(img: Image.Image):
+    img_tensor = transform(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        for label_name, label_val, max_img in [(REAL_FOLDER, 1, IMG_LIMIT_PER_CLASS), (FAKE_FOLDER, 0, IMG_LIMIT_PER_CLASS)]:
-            path = os.path.join(DATA_DIR, label_name)
-            count = 0
-            for fname in tqdm(os.listdir(path), desc=label_name):
-                if count >= max_img:
-                    break
-                try:
-                    img = Image.open(os.path.join(path, fname)).convert("RGB")
-                    img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
-                    feat = model.encode_image(img_tensor)
-                    feat /= feat.norm(dim=-1, keepdim=True)
-                    all_feats.append(feat.cpu().numpy())
-                    all_labels.append(label_val)
-                    count += 1
-                except Exception:
-                    continue
+        embedding = model.encode_image(img_tensor).cpu().numpy().flatten()
+    return embedding / np.linalg.norm(embedding)
 
-    all_feats = np.vstack(all_feats)
-    all_labels = np.array(all_labels)
+def extract_forensic_features(image_np: np.ndarray):
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    dct = cv2.dct(np.float32(gray) / 255.0)
+    hist = cv2.calcHist([gray], [0], None, [64], [0, 256]).flatten()
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edge = np.mean(np.abs(sobelx) + np.abs(sobely))
+    return np.concatenate([
+        dct[:8, :8].flatten(),
+        hist / (hist.sum() + 1e-8),
+        [edge]
+    ])
 
-    print("🧹 Step 2: Clean filtering based on self-alignment...")
-    temp_real_mean = np.mean(all_feats[all_labels == 1], axis=0)
-    temp_fake_mean = np.mean(all_feats[all_labels == 0], axis=0)
+def extract_patch_coherence_features(img: Image.Image):
+    img = img.resize((224, 224))
+    patches = []
+    for i in range(3):
+        for j in range(3):
+            patch = img.crop((j*75, i*75, j*75+75, i*75+75))
+            emb = extract_clip_embedding(patch)
+            patches.append(emb)
+    patch_embeddings = np.stack(patches)
+    stddev = np.std(patch_embeddings, axis=0)
+    return np.array([np.mean(stddev)])
 
-    real_feats_clean = []
-    fake_feats_clean = []
+# === DATASET LOADING === #
+def load_features(data_dir):
+    features, labels = [], []
+    for label, class_dir in enumerate(["real", "fake"]):
+        class_path = os.path.join(data_dir, class_dir)
+        for fname in tqdm(os.listdir(class_path), desc=class_dir):
+            try:
+                img_path = os.path.join(class_path, fname)
+                img = Image.open(img_path).convert("RGB")
+                img_np = np.array(img)
 
-    for feat, label in zip(all_feats, all_labels):
-        sim_real = np.dot(feat, temp_real_mean)
-        sim_fake = np.dot(feat, temp_fake_mean)
-        if label == 1 and sim_real > sim_fake:
-            real_feats_clean.append(feat)
-        elif label == 0 and sim_fake > sim_real:
-            fake_feats_clean.append(feat)
+                clip_emb = extract_clip_embedding(img)
+                forensic = extract_forensic_features(img_np)
+                patch_std = extract_patch_coherence_features(img)
 
-    if not real_feats_clean or not fake_feats_clean:
-        print(f"❌ ERROR: Clean features empty — Real: {len(real_feats_clean)}, Fake: {len(fake_feats_clean)}")
-        return
+                feature_vec = np.concatenate([clip_emb, forensic, patch_std])
+                features.append(feature_vec)
+                labels.append(label)
+            except Exception as e:
+                print(f"Skipping {fname}: {e}")
+    return np.array(features), np.array(labels)
 
-    real_mean = np.mean(np.vstack(real_feats_clean), axis=0)
-    fake_mean = np.mean(np.vstack(fake_feats_clean), axis=0)
-    np.savez(MEAN_VECTOR_PATH, real=real_mean, fake=fake_mean)
-    print(f"✅ Saved filtered mean vectors to: {MEAN_VECTOR_PATH}")
+# === MAIN PIPELINE === #
+features, labels = load_features("DeepGuardDB/train")
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(features)
 
-# ------------------ Predict Function ------------------ #
-def predict_image(image_path):
-    print(f"📷 Loading image: {image_path}")
-    model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
-    model.to(DEVICE).eval()
+clf = LogisticRegression(max_iter=1000)
+clf.fit(X_scaled, labels)
 
-    means = np.load(MEAN_VECTOR_PATH)
-    mean_real = torch.tensor(means['real'], dtype=torch.float32).to(DEVICE)
-    mean_fake = torch.tensor(means['fake'], dtype=torch.float32).to(DEVICE)
+# === SAVE FINAL MODEL (UNIFIED FOR DEPLOYMENT) === #
+realguard_model = {
+    "classifier": clf,
+    "scaler": scaler,
+    "model_name": MODEL_NAME,
+    "pretrained": PRETRAINED
+}
 
-    with torch.no_grad():
-        try:
-            img = Image.open(image_path).convert("RGB")
-            img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
-            img_feat = model.encode_image(img_tensor)
-            img_feat /= img_feat.norm(dim=-1, keepdim=True)
-        except Exception as e:
-            print(f"❌ Failed to process image: {e}")
-            return
+joblib.dump(realguard_model, "realguard_model.pkl")
 
-    sim_real = torch.cosine_similarity(img_feat, mean_real.unsqueeze(0)).item()
-    sim_fake = torch.cosine_similarity(img_feat, mean_fake.unsqueeze(0)).item()
-
-    label = "REAL" if sim_real > sim_fake else "FAKE"
-    conf = max(sim_real, sim_fake) * 100
-    print(f"🔍 Cosine Similarity — Real: {sim_real:.4f}, Fake: {sim_fake:.4f}")
-    print(f"✅ Prediction: {label} ({conf:.2f}% confident)")
-
-# ------------------ CLI ------------------ #
-if __name__ == '__main__':
-    import sys
-    if len(sys.argv) == 2 and sys.argv[1] == "build":
-        compute_class_means()
-    elif len(sys.argv) == 2:
-        predict_image(sys.argv[1])
-    else:
-        print("❌ Usage:")
-        print("   python clip_distance_classifier.py build          # to compute mean vectors")
-        print("   python clip_distance_classifier.py <image_path>  # to predict image")
+print("✅ RealGuard v3.0 trained and saved as unified .pkl model for deployment.")
