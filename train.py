@@ -1,4 +1,4 @@
-# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenCLIP Version with OpenAI-style Preprocessing)
+# clip_distance_classifier_openclip.py — CLIP Embedding Distance-Based Real vs Fake Classifier (OpenAI CLIP Style with EVA-CLIP Backend)
 
 import os
 import torch
@@ -31,8 +31,8 @@ clip_preprocess = transforms.Compose([
 
 # ------------------ Compute Mean Vectors ------------------ #
 def compute_class_means():
-    print("🚀 Loading OpenCLIP model...")
-    model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion400m_e32")
+    print("🚀 Loading EVA-CLIP model (OpenCLIP backend)...")
+    model, _, _ = open_clip.create_model_and_transforms("EVA02-B-32", pretrained="eva02_B_psz14_plus")
     model = model.to(DEVICE)
     model.eval()
 
@@ -74,7 +74,7 @@ def compute_class_means():
 # ------------------ Predict Function ------------------ #
 def predict_image(image_path):
     print(f"📷 Loading image: {image_path}")
-    model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion400m_e32")
+    model, _, _ = open_clip.create_model_and_transforms("EVA02-B-32", pretrained="eva02_B_psz14_plus")
     model = model.to(DEVICE)
     model.eval()
 
