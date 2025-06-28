@@ -14,7 +14,8 @@ DATA_DIR = ""
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 REAL_CLASS = "Real"
 MEAN_VECTOR_PATH = "clip_mean_vectors.npz"
-IMG_LIMIT_PER_CLASS = 200
+FAKE_IMG_LIMIT_PER_CLASS = 200
+REAL_IMG_LIMIT_TOTAL = 1000
 MARGIN_THRESHOLD = 0.009
 
 # ------------------ Preprocessing (match OpenAI CLIP) ------------------ #
@@ -36,27 +37,32 @@ def compute_class_means():
     model.eval()
 
     real_feats, fake_feats = [], []
+    real_img_count = 0
 
     print("📊 Extracting image embeddings for mean computation...")
     with torch.no_grad():
         for cls_name in sorted(os.listdir(TRAIN_DIR)):
             cls_path = os.path.join(TRAIN_DIR, cls_name)
-            label = 1 if cls_name == REAL_CLASS else 0
+            is_real = cls_name == REAL_CLASS
             count = 0
 
             for fname in tqdm(os.listdir(cls_path), desc=f"{cls_name}"):
-                if count >= IMG_LIMIT_PER_CLASS:
+                if is_real and real_img_count >= REAL_IMG_LIMIT_TOTAL:
                     break
+                if not is_real and count >= FAKE_IMG_LIMIT_PER_CLASS:
+                    break
+
                 try:
                     img = Image.open(os.path.join(cls_path, fname)).convert("RGB")
                     img_tensor = clip_preprocess(img).unsqueeze(0).to(DEVICE)
                     feat = model.encode_image(img_tensor)
                     feat /= feat.norm(dim=-1, keepdim=True)
-                    if label == 1:
+                    if is_real:
                         real_feats.append(feat.cpu().numpy())
+                        real_img_count += 1
                     else:
                         fake_feats.append(feat.cpu().numpy())
-                    count += 1
+                        count += 1
                 except Exception:
                     continue
 
