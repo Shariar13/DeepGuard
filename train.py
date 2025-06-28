@@ -1,4 +1,4 @@
-# clip_distance_classifier.py — Commercial-Safe, Balanced CLIP Real vs Fake Classifier (OpenCLIP)
+# clip_distance_classifier.py — Commercial-Safe, Balanced CLIP Real vs Fake Classifier (OpenCLIP + Clean Filtering)
 
 import os
 import torch
@@ -23,17 +23,18 @@ torch.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# ------------------ Compute Mean Vectors ------------------ #
+# ------------------ Compute Clean Mean Vectors ------------------ #
 def compute_class_means():
     print("🚀 Loading OpenCLIP model...")
     model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
     model.to(DEVICE).eval()
 
-    real_feats, fake_feats = [], []
+    all_feats = []
+    all_labels = []
 
-    print("📊 Extracting embeddings...")
+    print("📊 Step 1: Gathering all embeddings...")
     with torch.no_grad():
-        for label_name, storage, max_img in [(REAL_FOLDER, real_feats, IMG_LIMIT_PER_CLASS), (FAKE_FOLDER, fake_feats, IMG_LIMIT_PER_CLASS)]:
+        for label_name, label_val, max_img in [(REAL_FOLDER, 1, IMG_LIMIT_PER_CLASS), (FAKE_FOLDER, 0, IMG_LIMIT_PER_CLASS)]:
             path = os.path.join(DATA_DIR, label_name)
             count = 0
             for fname in tqdm(os.listdir(path), desc=label_name):
@@ -44,20 +45,38 @@ def compute_class_means():
                     img_tensor = preprocess(img).unsqueeze(0).to(DEVICE)
                     feat = model.encode_image(img_tensor)
                     feat /= feat.norm(dim=-1, keepdim=True)
-                    storage.append(feat.cpu().numpy())
+                    all_feats.append(feat.cpu().numpy())
+                    all_labels.append(label_val)
                     count += 1
                 except Exception:
                     continue
 
-    if not real_feats or not fake_feats:
-        print(f"❌ ERROR: Empty feature list — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
+    all_feats = np.vstack(all_feats)
+    all_labels = np.array(all_labels)
+
+    print("🧹 Step 2: Clean filtering based on self-alignment...")
+    temp_real_mean = np.mean(all_feats[all_labels == 1], axis=0)
+    temp_fake_mean = np.mean(all_feats[all_labels == 0], axis=0)
+
+    real_feats_clean = []
+    fake_feats_clean = []
+
+    for feat, label in zip(all_feats, all_labels):
+        sim_real = np.dot(feat, temp_real_mean)
+        sim_fake = np.dot(feat, temp_fake_mean)
+        if label == 1 and sim_real > sim_fake:
+            real_feats_clean.append(feat)
+        elif label == 0 and sim_fake > sim_real:
+            fake_feats_clean.append(feat)
+
+    if not real_feats_clean or not fake_feats_clean:
+        print(f"❌ ERROR: Clean features empty — Real: {len(real_feats_clean)}, Fake: {len(fake_feats_clean)}")
         return
 
-    print(f"📦 Final Feature Counts — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
-    real_mean = np.mean(np.vstack(real_feats), axis=0)
-    fake_mean = np.mean(np.vstack(fake_feats), axis=0)
+    real_mean = np.mean(np.vstack(real_feats_clean), axis=0)
+    fake_mean = np.mean(np.vstack(fake_feats_clean), axis=0)
     np.savez(MEAN_VECTOR_PATH, real=real_mean, fake=fake_mean)
-    print(f"✅ Mean vectors saved to: {MEAN_VECTOR_PATH}")
+    print(f"✅ Saved filtered mean vectors to: {MEAN_VECTOR_PATH}")
 
 # ------------------ Predict Function ------------------ #
 def predict_image(image_path):
