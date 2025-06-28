@@ -52,7 +52,9 @@ def main():
         prnu_score = compute_prnu_score(prnu_residual)
         classification = classify_by_prnu(prnu_score)
 
+        prnu_percentage = (prnu_score / 0.95) * 100
         print(f"[RESULT] PRNU Score: {prnu_score:.4f}")
+        print(f"[RESULT] PRNU Strength vs Threshold: {prnu_percentage:.2f}%")
         print(f"[RESULT] Classification: {classification}")
 
     except Exception as e:
