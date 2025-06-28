@@ -1,4 +1,4 @@
-# clip_distance_classifier.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Commercial-Safe + Alignment Check)
+# clip_distance_classifier.py — CLIP Embedding Distance-Based Real vs Fake Classifier (Commercial-Safe, No Filtering)
 
 import os
 import torch
@@ -16,14 +16,14 @@ IMG_LIMIT_PER_CLASS = 200
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
 
-# ------------------ Compute Mean Vectors with Alignment Filtering ------------------ #
+# ------------------ Compute Mean Vectors ------------------ #
 def compute_class_means():
     print("🚀 Loading OpenCLIP model...")
     model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
     model.to(DEVICE).eval()
 
     real_feats, fake_feats = [], []
-    print("📊 Extracting and aligning embeddings...")
+    print("📊 Extracting embeddings...")
 
     with torch.no_grad():
         for split in ["train", "val"]:
@@ -42,21 +42,11 @@ def compute_class_means():
                         feat = model.encode_image(img_tensor)
                         feat /= feat.norm(dim=-1, keepdim=True)
 
-                        # Temporary candidate pool
                         if label == 1:
-                            temp_real_feats = real_feats + [feat.cpu().numpy()]
-                            temp_real_mean = np.mean(np.vstack(temp_real_feats), axis=0)
-                            sim_real = torch.cosine_similarity(feat, torch.tensor(temp_real_mean).to(DEVICE).unsqueeze(0)).item()
-                            if sim_real > 0.6:
-                                real_feats.append(feat.cpu().numpy())
-                                count += 1
+                            real_feats.append(feat.cpu().numpy())
                         else:
-                            temp_fake_feats = fake_feats + [feat.cpu().numpy()]
-                            temp_fake_mean = np.mean(np.vstack(temp_fake_feats), axis=0) if fake_feats else feat.cpu().numpy()
-                            sim_fake = torch.cosine_similarity(feat, torch.tensor(temp_fake_mean).to(DEVICE).unsqueeze(0)).item()
-                            if sim_fake > 0.6:
-                                fake_feats.append(feat.cpu().numpy())
-                                count += 1
+                            fake_feats.append(feat.cpu().numpy())
+                        count += 1
                     except Exception:
                         continue
 
@@ -64,7 +54,7 @@ def compute_class_means():
         print(f"❌ ERROR: Empty feature list — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
         return
 
-    print(f"📦 Final Aligned Feature Counts — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
+    print(f"📦 Final Feature Counts — Real: {len(real_feats)}, Fake: {len(fake_feats)}")
     real_mean = np.mean(np.vstack(real_feats), axis=0)
     fake_mean = np.mean(np.vstack(fake_feats), axis=0)
     np.savez(MEAN_VECTOR_PATH, real=real_mean, fake=fake_mean)
