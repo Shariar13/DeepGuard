@@ -1,66 +1,98 @@
-import cv2
-import numpy as np
-from scipy.signal import correlate2d
-import argparse
+# test.py — Evaluate RealGuard v3.0 on unseen data
+
 import os
-import time
-from skimage.restoration import denoise_wavelet
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+import torch
+import torchvision.transforms as T
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import joblib
+import cv2
 
-def extract_prnu(image_path, resize_dim=(512, 512)):
-    """Extract a more advanced PRNU (noise residual) from a grayscale image using wavelet denoising."""
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise ValueError(f"Could not load image: {image_path}")
+from open_clip import create_model_and_transforms
 
-    img = cv2.resize(img, resize_dim).astype(np.float32) / 255.0
+# === Load Saved Model === #
+realguard_model = joblib.load("realguard_model.pkl")
+clf = realguard_model["classifier"]
+scaler = realguard_model["scaler"]
+model_name = realguard_model["model_name"]
+pretrained = realguard_model["pretrained"]
 
-    # Apply wavelet denoising to simulate high-frequency removal
-    denoised = denoise_wavelet(img, channel_axis=None, rescale_sigma=True)
-    denoised = np.clip(denoised, 0, 1)
-    noise_residual = img - denoised
-    return noise_residual
+# === Load CLIP Model === #
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess, _ = create_model_and_transforms(model_name, pretrained=pretrained)
+model = model.to(DEVICE).eval()
 
-def compute_prnu_score(noise_residual):
-    """Compute the self-correlation PRNU score from the noise residual."""
-    corr = correlate2d(noise_residual, noise_residual, mode='same')
-    center = corr.shape[0] // 2
-    score = corr[center, center] / np.max(corr)
-    return float(score)
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.4815, 0.4578, 0.4082], std=[0.2686, 0.2613, 0.2758])
+])
 
-def classify_by_prnu(score, threshold=0.95):
-    """Classify image as real or fake based on PRNU score."""
-    if score >= threshold:
-        return "REAL (Strong PRNU detected)"
-    else:
-        return "FAKE or Weak PRNU"
+# === Feature Extractors === #
+def extract_clip_embedding(img: Image.Image):
+    img_tensor = transform(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        embedding = model.encode_image(img_tensor).cpu().numpy().flatten()
+    return embedding / np.linalg.norm(embedding)
 
-def main():
-    parser = argparse.ArgumentParser(description="PRNU-based Real/Fake Image Classifier")
-    parser.add_argument("image", help="Path to the image file")
-    args = parser.parse_args()
+def extract_forensic_features(image_np: np.ndarray):
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    dct = cv2.dct(np.float32(gray) / 255.0)
+    hist = cv2.calcHist([gray], [0], None, [64], [0, 256]).flatten()
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edge = np.mean(np.abs(sobelx) + np.abs(sobely))
+    return np.concatenate([
+        dct[:8, :8].flatten(),
+        hist / (hist.sum() + 1e-8),
+        [edge]
+    ])
 
-    image_path = args.image
-    if not os.path.isfile(image_path):
-        print(f"[ERROR] File not found: {image_path}")
-        return
+def extract_patch_coherence_features(img: Image.Image):
+    img = img.resize((224, 224))
+    patches = []
+    for i in range(3):
+        for j in range(3):
+            patch = img.crop((j*75, i*75, j*75+75, i*75+75))
+            emb = extract_clip_embedding(patch)
+            patches.append(emb)
+    patch_embeddings = np.stack(patches)
+    stddev = np.std(patch_embeddings, axis=0)
+    return np.array([np.mean(stddev)])
 
-    print(f"[INFO] Analyzing: {image_path}")
-    start_time = time.time()
+# === Load Test Features === #
+def load_test_features(test_dir):
+    features, labels = [], []
+    for label, class_dir in enumerate(["real", "fake"]):
+        class_path = os.path.join(test_dir, class_dir)
+        for fname in tqdm(os.listdir(class_path), desc=f"Testing {class_dir}"):
+            try:
+                img_path = os.path.join(class_path, fname)
+                img = Image.open(img_path).convert("RGB")
+                img_np = np.array(img)
 
-    try:
-        prnu_residual = extract_prnu(image_path)
-        prnu_score = compute_prnu_score(prnu_residual)
-        classification = classify_by_prnu(prnu_score)
+                clip_emb = extract_clip_embedding(img)
+                forensic = extract_forensic_features(img_np)
+                patch_std = extract_patch_coherence_features(img)
 
-        prnu_percentage = (prnu_score / 0.95) * 100
-        print(f"[RESULT] PRNU Score: {prnu_score:.4f}")
-        print(f"[RESULT] PRNU Strength vs Threshold: {prnu_percentage:.2f}%")
-        print(f"[RESULT] Classification: {classification}")
+                feature_vec = np.concatenate([clip_emb, forensic, patch_std])
+                features.append(feature_vec)
+                labels.append(label)
+            except Exception as e:
+                print(f"Skipping {fname}: {e}")
+    return np.array(features), np.array(labels)
 
-    except Exception as e:
-        print(f"[ERROR] Failed to process image: {str(e)}")
+# === Run Evaluation === #
+X_test, y_test = load_test_features("DeepGuardDB/test")
+X_scaled = scaler.transform(X_test)
+y_pred = clf.predict(X_scaled)
 
-    print(f"[INFO] Total time: {time.time() - start_time:.2f} seconds")
-
-if __name__ == "__main__":
-    main()
+# === Metrics === #
+print("\n✅ Evaluation Results:")
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=["Real", "Fake"]))
